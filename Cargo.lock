@@ -1286,6 +1286,7 @@ dependencies = [
  "eyre",
  "tokio",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

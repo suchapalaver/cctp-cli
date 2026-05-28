@@ -34,3 +34,14 @@ hold HyperEVM gas.
 
 Use `--dry-run` to print route and Trezor account details without sending
 transactions.
+
+## Configuration
+
+Configuration is treated as a service boundary. Raw CLI/env input is resolved
+once into a validated `BridgeConfig`; execution code consumes that immutable
+config instead of reading flags or environment variables directly.
+
+Domain primitives are shared with `cctp-rs` where they belong. The CLI uses
+`CctpV2Route` for route validation and `UsdcAmount` for six-decimal USDC amount
+parsing. Wallet backends, RPC endpoints, dry-run behavior, and relay policy stay
+in the CLI because they are application concerns.

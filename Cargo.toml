@@ -11,3 +11,4 @@ cctp-rs = { path = "../cctp-rs" }
 eyre = "0.6"
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
