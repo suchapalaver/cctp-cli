@@ -45,8 +45,9 @@ To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
 The relay signer defaults to `--trezor-account`, but can be selected
 independently with `--relay-trezor-account`.
 
-Use `--dry-run` to print route and Trezor account details without sending
-transactions.
+Before any signing prompt, the CLI prints each active Trezor account's role,
+derivation path, chain binding, and address. Use `--dry-run` to inspect those
+details without sending transactions.
 
 ## Configuration
 

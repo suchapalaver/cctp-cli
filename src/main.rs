@@ -199,16 +199,13 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
 
     let source_signer = wallet_service.source_signer(&config).await?;
     let relay_signer = wallet_service.relay_signer(&config).await?;
-    let source_signer_address = source_signer.address;
-    let relay_signer_address = relay_signer.as_ref().map(|runtime| runtime.address);
+    let source_account = source_signer.account;
+    let relay_account = relay_signer.as_ref().map(|runtime| runtime.account);
+    let source_signer_address = source_account.address;
+    let relay_signer_address = relay_account.map(|account| account.address);
     let recipient = config.recipient.resolve(source_signer_address);
 
-    let plan = ExecutionPlan::new(
-        &config,
-        source_signer_address,
-        recipient,
-        relay_signer_address,
-    );
+    let plan = ExecutionPlan::new(&config, source_account, recipient, relay_account);
     reporter.report_plan(&plan);
 
     if config.dry_run {
@@ -318,17 +315,22 @@ where
             args.receive_interval_secs.or(file.receive_interval_secs),
         )?;
 
+        let source_wallet = WalletConfig::from_kind(wallet, trezor_account);
+        source_wallet.validate()?;
+        let relay_wallet = RelayWalletConfig::new(
+            self_relay,
+            wallet,
+            args.relay_trezor_account.or(file.relay_trezor_account),
+            trezor_account,
+        );
+        relay_wallet.validate()?;
+
         Ok(BridgeConfig {
             route,
             amount: UsdcAmount::parse_decimal(&amount)?,
             rpc: RpcEndpoints::parse(ethereum_rpc, hyperevm_rpc)?,
-            source_wallet: WalletConfig::from_kind(wallet, trezor_account),
-            relay_wallet: RelayWalletConfig::new(
-                self_relay,
-                wallet,
-                args.relay_trezor_account.or(file.relay_trezor_account),
-                trezor_account,
-            ),
+            source_wallet,
+            relay_wallet,
             recipient: RecipientConfig::from(args.recipient.or(file.recipient)),
             usdc: args.usdc.or(file.usdc).unwrap_or(MAINNET_USDC),
             transfer_mode: transfer_mode(fast, max_fee_usdc.as_deref())?,
@@ -771,6 +773,14 @@ impl RouteConfig {
     const fn destination_chain(&self) -> NamedChain {
         self.route.destination_chain()
     }
+
+    const fn source_label(&self) -> &'static str {
+        self.source_label
+    }
+
+    const fn destination_label(&self) -> &'static str {
+        self.destination_label
+    }
 }
 
 impl std::fmt::Display for RouteConfig {
@@ -900,6 +910,50 @@ enum WalletConfig {
     Trezor { account: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalletRole {
+    SourceBurn,
+    DestinationRelay,
+}
+
+impl std::fmt::Display for WalletRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceBurn => f.write_str("source burn signer"),
+            Self::DestinationRelay => f.write_str("destination relay signer"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalletDerivationPath {
+    TrezorLive { account: u32 },
+}
+
+impl WalletDerivationPath {
+    const fn trezor_live(account: u32) -> Self {
+        Self::TrezorLive { account }
+    }
+}
+
+impl std::fmt::Display for WalletDerivationPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrezorLive { account } => write!(f, "m/44'/60'/{account}'/0/0"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WalletAccount {
+    role: WalletRole,
+    wallet: WalletConfig,
+    derivation_path: WalletDerivationPath,
+    chain_label: &'static str,
+    chain_id: u64,
+    address: Address,
+}
+
 impl WalletConfig {
     const fn from_kind(kind: WalletKind, trezor_account: u32) -> Self {
         match kind {
@@ -909,11 +963,45 @@ impl WalletConfig {
         }
     }
 
-    async fn trezor_signer(self, chain_id: u64) -> Result<TrezorSigner> {
+    fn validate(self) -> Result<()> {
+        self.trezor_account_index().map(|_| ())
+    }
+
+    fn account_info(
+        self,
+        role: WalletRole,
+        chain_label: &'static str,
+        chain_id: u64,
+        address: Address,
+    ) -> WalletAccount {
+        WalletAccount {
+            role,
+            wallet: self,
+            derivation_path: self.derivation_path(),
+            chain_label,
+            chain_id,
+            address,
+        }
+    }
+
+    fn trezor_account_index(self) -> Result<usize> {
         match self {
             Self::Trezor { account } => {
-                let account_index =
-                    usize::try_from(account).wrap_err("Trezor account index is too large")?;
+                usize::try_from(account).wrap_err("Trezor account index is too large")
+            }
+        }
+    }
+
+    const fn derivation_path(self) -> WalletDerivationPath {
+        match self {
+            Self::Trezor { account } => WalletDerivationPath::trezor_live(account),
+        }
+    }
+
+    async fn trezor_signer(self, chain_id: u64) -> Result<TrezorSigner> {
+        match self {
+            Self::Trezor { .. } => {
+                let account_index = self.trezor_account_index()?;
                 TrezorSigner::new(HDPath::TrezorLive(account_index), Some(chain_id))
                     .await
                     .map_err(Into::into)
@@ -963,23 +1051,38 @@ impl RelayWalletConfig {
             Self::Trezor { account } => Some(WalletConfig::Trezor { account }),
         }
     }
+
+    fn validate(self) -> Result<()> {
+        match self.wallet() {
+            Some(wallet) => wallet.validate(),
+            None => Ok(()),
+        }
+    }
 }
 
 struct RelaySignerRuntime {
     signer: TrezorSigner,
-    address: Address,
+    account: WalletAccount,
 }
 
 struct SourceSignerRuntime {
     signer: TrezorSigner,
-    address: Address,
+    account: WalletAccount,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TrezorWalletService;
 
-impl TrezorWalletService {
-    async fn source_signer(self, config: &BridgeConfig) -> Result<SourceSignerRuntime> {
+#[async_trait(?Send)]
+trait WalletService {
+    async fn source_signer(&self, config: &BridgeConfig) -> Result<SourceSignerRuntime>;
+
+    async fn relay_signer(&self, config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>>;
+}
+
+#[async_trait(?Send)]
+impl WalletService for TrezorWalletService {
+    async fn source_signer(&self, config: &BridgeConfig) -> Result<SourceSignerRuntime> {
         let signer = config
             .source_wallet
             .trezor_signer(config.route.source_chain_id())
@@ -989,11 +1092,17 @@ impl TrezorWalletService {
             .get_address()
             .await
             .wrap_err("failed to read Ethereum address from Trezor")?;
+        let account = config.source_wallet.account_info(
+            WalletRole::SourceBurn,
+            config.route.source_label(),
+            config.route.source_chain_id(),
+            address,
+        );
 
-        Ok(SourceSignerRuntime { signer, address })
+        Ok(SourceSignerRuntime { signer, account })
     }
 
-    async fn relay_signer(self, config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>> {
+    async fn relay_signer(&self, config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>> {
         let Some(wallet) = config.relay_wallet.wallet() else {
             return Ok(None);
         };
@@ -1006,8 +1115,14 @@ impl TrezorWalletService {
             .get_address()
             .await
             .wrap_err("failed to read HyperEVM relay address from Trezor")?;
+        let account = wallet.account_info(
+            WalletRole::DestinationRelay,
+            config.route.destination_label(),
+            config.route.destination_chain_id(),
+            address,
+        );
 
-        Ok(Some(RelaySignerRuntime { signer, address }))
+        Ok(Some(RelaySignerRuntime { signer, account }))
     }
 }
 
@@ -1067,33 +1182,31 @@ impl AlloyProviderService {
 #[derive(Clone, Debug)]
 struct ExecutionPlan {
     route: RouteConfig,
-    source_wallet: WalletConfig,
-    source_signer: Address,
+    source_account: WalletAccount,
     recipient: Address,
     usdc: Address,
     amount: UsdcAmount,
     transfer_mode: TransferMode,
     relay: RelayMode,
-    relay_signer: Option<Address>,
+    relay_account: Option<WalletAccount>,
 }
 
 impl ExecutionPlan {
     fn new(
         config: &BridgeConfig,
-        source_signer: Address,
+        source_account: WalletAccount,
         recipient: Address,
-        relay_signer: Option<Address>,
+        relay_account: Option<WalletAccount>,
     ) -> Self {
         Self {
             route: config.route,
-            source_wallet: config.source_wallet,
-            source_signer,
+            source_account,
             recipient,
             usdc: config.usdc,
             amount: config.amount,
             transfer_mode: config.transfer_mode.clone(),
             relay: config.relay,
-            relay_signer,
+            relay_account,
         }
     }
 }
@@ -1104,17 +1217,27 @@ struct HumanReporter;
 impl HumanReporter {
     fn report_plan(self, plan: &ExecutionPlan) {
         println!("Route: {}", plan.route);
-        println!("Source wallet: {}", plan.source_wallet);
-        println!("Source signer: {}", plan.source_signer);
+        self.report_wallet_account("Source", &plan.source_account);
         println!("Recipient: {}", plan.recipient);
         println!("USDC: {}", plan.usdc);
         println!("Amount: {} USDC", plan.amount);
         println!("Mode: {}", mode_label(&plan.transfer_mode));
         println!("Relay: {}", plan.relay);
-        match plan.relay_signer {
-            Some(address) => println!("Relay signer: {address}"),
+        match plan.relay_account {
+            Some(account) => self.report_wallet_account("Relay", &account),
             None => println!("Destination provider: read-only"),
         }
+    }
+
+    fn report_wallet_account(self, label: &str, account: &WalletAccount) {
+        println!("{label} role: {}", account.role);
+        println!("{label} wallet: {}", account.wallet);
+        println!("{label} derivation: {}", account.derivation_path);
+        println!(
+            "{label} chain: {} (chain id {})",
+            account.chain_label, account.chain_id
+        );
+        println!("{label} address: {}", account.address);
     }
 
     fn report_dry_run_complete(self) {
@@ -1342,6 +1465,38 @@ mod tests {
         let config = empty_service().bridge_config(args).expect("valid config");
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
         assert_eq!(config.relay_wallet, RelayWalletConfig::None);
+    }
+
+    #[test]
+    fn wallet_config_describes_trezor_derivation_and_chain_binding() {
+        let wallet = WalletConfig::Trezor { account: 3 };
+        let address = address!("0000000000000000000000000000000000000003");
+
+        let account = wallet.account_info(WalletRole::SourceBurn, "Ethereum mainnet", 1, address);
+
+        wallet.validate().expect("wallet config is valid");
+        assert_eq!(account.role, WalletRole::SourceBurn);
+        assert_eq!(account.wallet, wallet);
+        assert_eq!(
+            account.derivation_path,
+            WalletDerivationPath::TrezorLive { account: 3 }
+        );
+        assert_eq!(account.derivation_path.to_string(), "m/44'/60'/3'/0/0");
+        assert_eq!(account.chain_label, "Ethereum mainnet");
+        assert_eq!(account.chain_id, 1);
+        assert_eq!(account.address, address);
+    }
+
+    #[test]
+    fn relay_wallet_config_validates_without_device() {
+        let relay_wallet = RelayWalletConfig::new(true, WalletKind::Trezor, Some(2), 0);
+
+        relay_wallet.validate().expect("relay wallet is valid");
+        assert_eq!(
+            relay_wallet.wallet().expect("relay wallet exists"),
+            WalletConfig::Trezor { account: 2 }
+        );
+        assert!(RelayWalletConfig::None.validate().is_ok());
     }
 
     #[test]
