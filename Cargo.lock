@@ -1276,7 +1276,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cctp-cli"
+name = "cctp"
 version = "0.1.0"
 dependencies = [
  "alloy",

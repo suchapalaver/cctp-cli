@@ -1217,10 +1217,8 @@ mod tests {
 
     fn write_config(contents: &str) -> PathBuf {
         let count = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "cctp-cli-config-{}-{count}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("cctp-config-{}-{count}.toml", std::process::id()));
         std::fs::write(&path, contents).expect("write config");
         path
     }

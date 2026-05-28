@@ -1,7 +1,17 @@
 [package]
-name = "cctp-cli"
+name = "cctp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
+authors = ["Joseph Livesey <jlivesey@gmail.com>"]
+description = "Trezor-backed CLI for bridging USDC with Circle CCTP via cctp-rs."
+license = "Apache-2.0"
+repository = "https://github.com/suchapalaver/cctp"
+homepage = "https://github.com/suchapalaver/cctp"
+readme = "README.md"
+keywords = ["cctp", "usdc", "circle", "bridge", "trezor"]
+categories = ["command-line-utilities", "finance"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "src/main.rs"]
 
 [dependencies]
 alloy = { version = "2.0.5", features = ["signer-trezor"] }

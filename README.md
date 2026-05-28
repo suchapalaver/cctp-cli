@@ -1,4 +1,4 @@
-# cctp-cli
+# cctp
 
 Small Trezor-backed CLI for bridging USDC with
 [`cctp-rs`](https://crates.io/crates/cctp-rs).
@@ -7,13 +7,22 @@ The first supported route is Ethereum mainnet to HyperEVM. The CLI uses Alloy's
 Trezor signer support and defaults to waiting for any permissionless relayer to
 complete the destination mint.
 
+## Install
+
+```sh
+cargo install cctp
+```
+
+The source repository, published crate, and installed command are all named
+`cctp`.
+
 ## Usage
 
 ```sh
 export ETHEREUM_RPC_URL="https://..."
 export HYPEREVM_RPC_URL="https://..."
 
-cargo run -- bridge \
+cctp bridge \
   --amount 10.25 \
   --recipient 0x0000000000000000000000000000000000000000
 ```
@@ -22,7 +31,7 @@ By default this sends standard-finality CCTP v2 transactions. To request fast
 finality, provide an explicit fee cap:
 
 ```sh
-cargo run -- bridge \
+cctp bridge \
   --amount 10.25 \
   --fast \
   --max-fee-usdc 0.01
@@ -70,7 +79,7 @@ dry_run = false
 Run with:
 
 ```sh
-cargo run -- bridge --config cctp.toml --amount 25
+cctp bridge --config cctp.toml --amount 25
 ```
 
 Domain primitives are shared with `cctp-rs` where they belong. The CLI uses
