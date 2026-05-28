@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 alloy = { version = "2.0.5", features = ["signer-trezor"] }
 alloy-chains = "0.2"
+async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 cctp-rs = { path = "../cctp-rs" }
 eyre = "0.6"
