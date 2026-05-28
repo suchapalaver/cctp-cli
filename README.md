@@ -1,7 +1,7 @@
 # cctp-cli
 
 Small Trezor-backed CLI for bridging USDC with
-[`cctp-rs`](../cctp-rs).
+[`cctp-rs`](https://crates.io/crates/cctp-rs).
 
 The first supported route is Ethereum mainnet to HyperEVM. The CLI uses Alloy's
 Trezor signer support and defaults to waiting for any permissionless relayer to
@@ -44,6 +44,34 @@ transactions.
 Configuration is treated as a service boundary. Raw CLI/env input is resolved
 once into a validated `BridgeConfig`; execution code consumes that immutable
 config instead of reading flags or environment variables directly.
+
+Precedence is:
+
+1. CLI flags.
+2. Environment variables for RPC URLs: `ETHEREUM_RPC_URL` and
+   `HYPEREVM_RPC_URL`.
+3. TOML config file passed with `--config`.
+4. Built-in defaults for route, wallet, account, relay mode, and transfer mode.
+
+`amount`, `ethereum_rpc`, and `hyperevm_rpc` must be supplied by CLI, env, or
+config file. Example:
+
+```toml
+amount = "10.25"
+ethereum_rpc = "https://..."
+hyperevm_rpc = "https://..."
+recipient = "0x0000000000000000000000000000000000000000"
+trezor_account = 0
+fast = false
+self_relay = false
+dry_run = false
+```
+
+Run with:
+
+```sh
+cargo run -- bridge --config cctp.toml --amount 25
+```
 
 Domain primitives are shared with `cctp-rs` where they belong. The CLI uses
 `CctpV2Route` for route validation and `UsdcAmount` for six-decimal USDC amount
