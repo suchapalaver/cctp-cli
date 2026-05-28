@@ -28,9 +28,13 @@ cargo run -- bridge \
   --max-fee-usdc 0.01
 ```
 
-By default the CLI waits for any relayer to complete the mint on HyperEVM. To
-self-relay from the same Trezor account, add `--self-relay`; that account must
-hold HyperEVM gas.
+By default the CLI waits for any relayer to complete the mint on HyperEVM. It
+uses a read-only HyperEVM provider and does not initialize a destination signer
+or require HyperEVM gas.
+
+To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
+The relay signer defaults to `--trezor-account`, but can be selected
+independently with `--relay-trezor-account`.
 
 Use `--dry-run` to print route and Trezor account details without sending
 transactions.

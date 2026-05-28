@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use alloy::{
     primitives::{Address, TxHash, address},
-    providers::{Provider, ProviderBuilder},
+    providers::{DynProvider, Provider, ProviderBuilder},
     signers::trezor::{HDPath, TrezorSigner},
 };
 use alloy_chains::NamedChain;
@@ -63,6 +63,12 @@ struct BridgeArgs {
     /// Trezor Live account index: m/44'/60'/account'/0/0.
     #[arg(long, default_value_t = 0)]
     trezor_account: u32,
+
+    /// Trezor Live account index used only for --self-relay on HyperEVM.
+    ///
+    /// Defaults to --trezor-account when omitted.
+    #[arg(long)]
+    relay_trezor_account: Option<u32>,
 
     /// Override the Ethereum mainnet USDC address.
     #[arg(long)]
@@ -151,53 +157,42 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let config = CliConfigService.bridge_config(args)?;
 
     let source_signer = config
-        .wallet
+        .source_wallet
         .trezor_signer(config.route.source_chain_id())
         .await
         .wrap_err("failed to initialize Trezor signer for Ethereum mainnet")?;
-    let signer_address = source_signer
+    let source_signer_address = source_signer
         .get_address()
         .await
         .wrap_err("failed to read Ethereum address from Trezor")?;
 
-    let destination_signer = config
-        .wallet
-        .trezor_signer(config.route.destination_chain_id())
-        .await
-        .wrap_err("failed to initialize Trezor signer for HyperEVM")?;
-    let destination_signer_address = destination_signer
-        .get_address()
-        .await
-        .wrap_err("failed to read HyperEVM address from Trezor")?;
-
-    if signer_address != destination_signer_address {
-        bail!(
-            "Trezor returned different source and destination addresses: {signer_address} vs {destination_signer_address}"
-        );
-    }
-
-    let recipient = config.recipient.resolve(signer_address);
+    let relay_signer = relay_signer(&config).await?;
+    let relay_signer_address = relay_signer.as_ref().map(|runtime| runtime.address);
+    let recipient = config.recipient.resolve(source_signer_address);
 
     println!("Route: {}", config.route);
-    println!("Wallet: {}", config.wallet);
-    println!("Signer: {signer_address}");
+    println!("Source wallet: {}", config.source_wallet);
+    println!("Source signer: {source_signer_address}");
     println!("Recipient: {recipient}");
     println!("USDC: {}", config.usdc);
     println!("Amount: {} USDC", config.amount);
     println!("Mode: {}", mode_label(&config.transfer_mode));
     println!("Relay: {}", config.relay);
+    match relay_signer_address {
+        Some(address) => println!("Relay signer: {address}"),
+        None => println!("Destination provider: read-only"),
+    }
 
     if config.dry_run {
         println!("Dry run complete. No transactions sent.");
         return Ok(());
     }
 
-    let source_provider = ProviderBuilder::new()
+    let source_provider: DynProvider = ProviderBuilder::new()
         .wallet(source_signer)
-        .connect_http(config.rpc.source.clone());
-    let destination_provider = ProviderBuilder::new()
-        .wallet(destination_signer)
-        .connect_http(config.rpc.destination.clone());
+        .connect_http(config.rpc.source.clone())
+        .erased();
+    let destination_provider = destination_provider(&config, relay_signer);
 
     let bridge = CctpV2Bridge::builder()
         .source_chain(config.route.source_chain())
@@ -215,7 +210,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     println!("Destination domain: {}", bridge.destination_domain_id()?);
 
     let allowance = bridge
-        .get_allowance(config.usdc, signer_address)
+        .get_allowance(config.usdc, source_signer_address)
         .await
         .wrap_err("failed to read USDC allowance")?;
 
@@ -225,7 +220,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
             config.amount.atomic()
         );
         let approval_tx = bridge
-            .approve(config.usdc, signer_address, config.amount.atomic())
+            .approve(config.usdc, source_signer_address, config.amount.atomic())
             .await
             .wrap_err("failed to send USDC approval transaction")?;
         println!("Approval tx: {approval_tx}");
@@ -246,7 +241,7 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
         config.amount.atomic()
     );
     let burn_tx = bridge
-        .burn(config.amount.atomic(), signer_address, config.usdc)
+        .burn(config.amount.atomic(), source_signer_address, config.usdc)
         .await
         .wrap_err("failed to send CCTP burn transaction")?;
     println!("Burn tx: {burn_tx}");
@@ -277,8 +272,10 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
 
     if config.relay == RelayMode::SelfRelay {
         println!("Submitting receiveMessage on HyperEVM.");
+        let relay_submitter = relay_signer_address
+            .ok_or_else(|| eyre!("--self-relay requires a destination relay signer"))?;
         match bridge
-            .mint_if_needed(message, attestation, signer_address)
+            .mint_if_needed(message, attestation, relay_submitter)
             .await
             .wrap_err("failed to self-relay CCTP mint on HyperEVM")?
         {
@@ -330,7 +327,13 @@ impl ConfigService for CliConfigService {
             route,
             amount: UsdcAmount::parse_decimal(&args.amount)?,
             rpc: RpcEndpoints::parse(args.ethereum_rpc, args.hyperevm_rpc)?,
-            wallet: WalletConfig::from_kind(args.wallet, args.trezor_account),
+            source_wallet: WalletConfig::from_kind(args.wallet, args.trezor_account),
+            relay_wallet: RelayWalletConfig::new(
+                args.self_relay,
+                args.wallet,
+                args.relay_trezor_account,
+                args.trezor_account,
+            ),
             recipient: RecipientConfig::from(args.recipient),
             usdc: args.usdc.unwrap_or(MAINNET_USDC),
             transfer_mode: transfer_mode(args.fast, args.max_fee_usdc.as_deref())?,
@@ -346,7 +349,8 @@ struct BridgeConfig {
     route: RouteConfig,
     amount: UsdcAmount,
     rpc: RpcEndpoints,
-    wallet: WalletConfig,
+    source_wallet: WalletConfig,
+    relay_wallet: RelayWalletConfig,
     recipient: RecipientConfig,
     usdc: Address,
     transfer_mode: TransferMode,
@@ -517,7 +521,7 @@ fn mode_label(mode: &TransferMode) -> &'static str {
     if mode.is_fast() { "fast" } else { "standard" }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalletConfig {
     Trezor { account: u32 },
 }
@@ -549,6 +553,78 @@ impl std::fmt::Display for WalletConfig {
         match self {
             Self::Trezor { account } => write!(f, "trezor account {account}"),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayWalletConfig {
+    None,
+    Trezor { account: u32 },
+}
+
+impl RelayWalletConfig {
+    const fn new(
+        self_relay: bool,
+        kind: WalletKind,
+        relay_trezor_account: Option<u32>,
+        source_trezor_account: u32,
+    ) -> Self {
+        if !self_relay {
+            return Self::None;
+        }
+
+        match kind {
+            WalletKind::Trezor => Self::Trezor {
+                account: match relay_trezor_account {
+                    Some(account) => account,
+                    None => source_trezor_account,
+                },
+            },
+        }
+    }
+
+    const fn wallet(self) -> Option<WalletConfig> {
+        match self {
+            Self::None => None,
+            Self::Trezor { account } => Some(WalletConfig::Trezor { account }),
+        }
+    }
+}
+
+struct RelaySignerRuntime {
+    signer: TrezorSigner,
+    address: Address,
+}
+
+async fn relay_signer(config: &BridgeConfig) -> Result<Option<RelaySignerRuntime>> {
+    let Some(wallet) = config.relay_wallet.wallet() else {
+        return Ok(None);
+    };
+
+    let signer = wallet
+        .trezor_signer(config.route.destination_chain_id())
+        .await
+        .wrap_err("failed to initialize Trezor signer for HyperEVM self-relay")?;
+    let address = signer
+        .get_address()
+        .await
+        .wrap_err("failed to read HyperEVM relay address from Trezor")?;
+
+    Ok(Some(RelaySignerRuntime { signer, address }))
+}
+
+fn destination_provider(
+    config: &BridgeConfig,
+    relay_signer: Option<RelaySignerRuntime>,
+) -> DynProvider {
+    match relay_signer {
+        Some(runtime) => ProviderBuilder::new()
+            .wallet(runtime.signer)
+            .connect_http(config.rpc.destination.clone())
+            .erased(),
+        None => ProviderBuilder::new()
+            .connect_http(config.rpc.destination.clone())
+            .erased(),
     }
 }
 
@@ -598,6 +674,7 @@ mod tests {
             hyperevm_rpc: "https://hyperevm.example".to_owned(),
             wallet: WalletKind::Trezor,
             trezor_account: 0,
+            relay_trezor_account: None,
             usdc: None,
             fast: false,
             max_fee_usdc: None,
@@ -619,6 +696,8 @@ mod tests {
         assert_eq!(config.amount.atomic(), U256::from(1_250_000u64));
         assert_eq!(config.recipient, RecipientConfig::Signer);
         assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
+        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert!(matches!(config.transfer_mode, TransferMode::Standard));
@@ -653,5 +732,42 @@ mod tests {
                 max_fee: U256::from(10_000u64)
             }
         );
+    }
+
+    #[test]
+    fn config_service_uses_source_wallet_for_default_self_relay_account() {
+        let mut args = sample_args();
+        args.self_relay = true;
+
+        let config = CliConfigService.bridge_config(args).expect("valid config");
+        assert_eq!(config.relay, RelayMode::SelfRelay);
+        assert_eq!(
+            config.relay_wallet,
+            RelayWalletConfig::Trezor { account: 0 }
+        );
+    }
+
+    #[test]
+    fn config_service_accepts_distinct_self_relay_account() {
+        let mut args = sample_args();
+        args.self_relay = true;
+        args.relay_trezor_account = Some(2);
+
+        let config = CliConfigService.bridge_config(args).expect("valid config");
+        assert_eq!(config.source_wallet, WalletConfig::Trezor { account: 0 });
+        assert_eq!(
+            config.relay_wallet,
+            RelayWalletConfig::Trezor { account: 2 }
+        );
+    }
+
+    #[test]
+    fn config_service_ignores_relay_account_without_self_relay() {
+        let mut args = sample_args();
+        args.relay_trezor_account = Some(2);
+
+        let config = CliConfigService.bridge_config(args).expect("valid config");
+        assert_eq!(config.relay, RelayMode::WaitForRelayer);
+        assert_eq!(config.relay_wallet, RelayWalletConfig::None);
     }
 }
