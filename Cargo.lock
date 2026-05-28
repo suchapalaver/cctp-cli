@@ -1292,7 +1292,9 @@ dependencies = [
 
 [[package]]
 name = "cctp-rs"
-version = "6.1.0"
+version = "6.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1836ab63a6aaa3360d27c5545810cf42895bbb99e15742fca9f2b66d59ede097"
 dependencies = [
  "alloy-chains",
  "alloy-contract",
