@@ -27,6 +27,11 @@ cctp bridge \
   --recipient 0x0000000000000000000000000000000000000000
 ```
 
+The CLI also loads `.env` from the current directory or a parent directory
+before resolving configuration. Keep real RPC URLs in local `.env`;
+`.env.example` documents the supported variable names and `.env` is ignored by
+git.
+
 By default this sends standard-finality CCTP v2 transactions. To request fast
 finality, provide an explicit fee cap:
 
@@ -86,6 +91,10 @@ Run with:
 ```sh
 cctp bridge --config cctp.toml --amount 25
 ```
+
+Local config files can contain RPC URLs with API keys. Keep those files local:
+`cctp.toml`, `cctp.local.toml`, `*.local.toml`, `.env`, and `.env.*` are ignored
+by git. Commit only sanitized examples.
 
 Domain primitives are shared with `cctp-rs` where they belong. The CLI uses
 `CctpV2Route` for route validation and `UsdcAmount` for six-decimal USDC amount

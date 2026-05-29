@@ -188,6 +188,8 @@ impl std::fmt::Display for WalletKind {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_dotenv()?;
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -195,6 +197,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Bridge(args) => run_bridge(args).await,
+    }
+}
+
+fn load_dotenv() -> Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).wrap_err("failed to load .env"),
     }
 }
 
