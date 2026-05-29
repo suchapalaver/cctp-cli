@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -124,7 +125,7 @@ struct BridgeArgs {
     #[arg(long)]
     receive_interval_secs: Option<u64>,
 
-    /// Print the route and signer details without sending transactions.
+    /// Print the bridge intent without sending transactions.
     #[arg(
         long,
         default_missing_value = "true",
@@ -133,6 +134,12 @@ struct BridgeArgs {
         value_parser = clap::value_parser!(bool),
     )]
     dry_run: Option<bool>,
+
+    /// Print the bridge intent but skip the interactive CONFIRM prompt.
+    ///
+    /// Intended for explicit non-interactive automation. Ignored by --dry-run.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -195,7 +202,14 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let config = CliConfigService::default().bridge_config(args)?;
     let wallet_service = TrezorWalletService;
     let provider_service = AlloyProviderService;
+    let provider_validation_service = AlloyProviderValidationService;
+    let approval_service = TerminalIntentApprovalService;
     let reporter = HumanReporter;
+
+    let validation_providers = provider_service.read_only_providers(&config);
+    let provider_validation = provider_validation_service
+        .validate(&config, &validation_providers)
+        .await?;
 
     let source_signer = wallet_service.source_signer(&config).await?;
     let relay_signer = wallet_service.relay_signer(&config).await?;
@@ -205,16 +219,25 @@ async fn run_bridge(args: BridgeArgs) -> Result<()> {
     let relay_signer_address = relay_account.map(|account| account.address);
     let recipient = config.recipient.resolve(source_signer_address);
 
-    let plan = ExecutionPlan::new(&config, source_account, recipient, relay_account);
-    reporter.report_plan(&plan);
+    let providers = provider_service.bridge_providers(&config, source_signer.signer, relay_signer);
+    let bridge = provider_service.bridge(&config, &providers, recipient);
+    let contracts = BridgeContracts::from_bridge(&bridge)?;
+    let intent = BridgeIntent::new(
+        &config,
+        source_account,
+        recipient,
+        relay_account,
+        provider_validation,
+        contracts,
+    );
+    reporter.report_intent(&intent);
 
     if config.dry_run {
         reporter.report_dry_run_complete();
         return Ok(());
     }
 
-    let providers = provider_service.bridge_providers(&config, source_signer.signer, relay_signer);
-    let bridge = provider_service.bridge(&config, &providers, recipient);
+    approval_service.confirm(&intent, config.confirmation)?;
     reporter.report_workflow_start();
 
     let runtime = CctpBridgeRuntime::new(bridge, providers.source, providers.destination);
@@ -337,6 +360,7 @@ where
             relay: RelayMode::from_self_relay(self_relay),
             receive_polling,
             dry_run,
+            confirmation: ConfirmationPolicy::from_yes(args.yes),
         })
     }
 }
@@ -388,6 +412,7 @@ struct BridgeConfig {
     relay: RelayMode,
     receive_polling: ReceivePolling,
     dry_run: bool,
+    confirmation: ConfirmationPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -865,6 +890,63 @@ impl std::fmt::Display for RelayMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmationPolicy {
+    RequireInteractive,
+    SkipPrompt,
+}
+
+impl ConfirmationPolicy {
+    const fn from_yes(yes: bool) -> Self {
+        if yes {
+            Self::SkipPrompt
+        } else {
+            Self::RequireInteractive
+        }
+    }
+}
+
+trait IntentApprovalService {
+    fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TerminalIntentApprovalService;
+
+impl IntentApprovalService for TerminalIntentApprovalService {
+    fn confirm(&self, intent: &BridgeIntent, policy: ConfirmationPolicy) -> Result<()> {
+        match policy {
+            ConfirmationPolicy::SkipPrompt => {
+                println!("Confirmation skipped by --yes.");
+                Ok(())
+            }
+            ConfirmationPolicy::RequireInteractive => {
+                print!(
+                    "Type CONFIRM to sign and submit this bridge intent for {} USDC: ",
+                    intent.amount
+                );
+                io::stdout()
+                    .flush()
+                    .wrap_err("failed to flush confirmation prompt")?;
+
+                let mut input = String::new();
+                io::stdin()
+                    .read_line(&mut input)
+                    .wrap_err("failed to read confirmation input")?;
+                validate_confirmation_input(&input)
+            }
+        }
+    }
+}
+
+fn validate_confirmation_input(input: &str) -> Result<()> {
+    if input.trim() == "CONFIRM" {
+        Ok(())
+    } else {
+        bail!("bridge intent was not confirmed")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReceivePolling {
     attempts: Option<u32>,
     interval_secs: Option<u64>,
@@ -1136,6 +1218,17 @@ struct BridgeProviders {
 struct AlloyProviderService;
 
 impl AlloyProviderService {
+    fn read_only_providers(self, config: &BridgeConfig) -> BridgeProviders {
+        BridgeProviders {
+            source: ProviderBuilder::new()
+                .connect_http(config.rpc.source.clone())
+                .erased(),
+            destination: ProviderBuilder::new()
+                .connect_http(config.rpc.destination.clone())
+                .erased(),
+        }
+    }
+
     fn bridge_providers(
         self,
         config: &BridgeConfig,
@@ -1179,8 +1272,147 @@ impl AlloyProviderService {
     }
 }
 
+#[async_trait(?Send)]
+trait ProviderValidationService {
+    async fn validate(
+        &self,
+        config: &BridgeConfig,
+        providers: &BridgeProviders,
+    ) -> Result<ProviderValidation>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AlloyProviderValidationService;
+
+#[async_trait(?Send)]
+impl ProviderValidationService for AlloyProviderValidationService {
+    async fn validate(
+        &self,
+        config: &BridgeConfig,
+        providers: &BridgeProviders,
+    ) -> Result<ProviderValidation> {
+        let source_chain_id = providers
+            .source
+            .get_chain_id()
+            .await
+            .wrap_err("failed to read source RPC chain ID")?;
+        let destination_chain_id = providers
+            .destination
+            .get_chain_id()
+            .await
+            .wrap_err("failed to read destination RPC chain ID")?;
+
+        ProviderValidation::new(config.route, source_chain_id, destination_chain_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderValidation {
+    source: ProviderChainCheck,
+    destination: ProviderChainCheck,
+}
+
+impl ProviderValidation {
+    fn new(
+        route: RouteConfig,
+        source_actual_chain_id: u64,
+        destination_actual_chain_id: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            source: ProviderChainCheck::validate(
+                route,
+                ProviderEndpointRole::Source,
+                route.source_label(),
+                route.source_chain_id(),
+                source_actual_chain_id,
+            )?,
+            destination: ProviderChainCheck::validate(
+                route,
+                ProviderEndpointRole::Destination,
+                route.destination_label(),
+                route.destination_chain_id(),
+                destination_actual_chain_id,
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderChainCheck {
+    role: ProviderEndpointRole,
+    chain_label: &'static str,
+    expected_chain_id: u64,
+    actual_chain_id: u64,
+}
+
+impl ProviderChainCheck {
+    fn validate(
+        route: RouteConfig,
+        role: ProviderEndpointRole,
+        chain_label: &'static str,
+        expected_chain_id: u64,
+        actual_chain_id: u64,
+    ) -> Result<Self> {
+        if actual_chain_id != expected_chain_id {
+            bail!(
+                "{} chain ID mismatch for route {route}: expected {expected_chain_id} ({chain_label}), got {actual_chain_id}",
+                role.error_label()
+            );
+        }
+
+        Ok(Self {
+            role,
+            chain_label,
+            expected_chain_id,
+            actual_chain_id,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderEndpointRole {
+    Source,
+    Destination,
+}
+
+impl ProviderEndpointRole {
+    const fn error_label(self) -> &'static str {
+        match self {
+            Self::Source => "source RPC",
+            Self::Destination => "destination RPC",
+        }
+    }
+
+    const fn report_label(self) -> &'static str {
+        match self {
+            Self::Source => "Source RPC",
+            Self::Destination => "Destination RPC",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BridgeContracts {
+    token_messenger: Address,
+    message_transmitter: Address,
+    destination_domain: DomainId,
+}
+
+impl BridgeContracts {
+    fn from_bridge<P>(bridge: &CctpV2Bridge<P>) -> Result<Self>
+    where
+        P: Provider + Clone,
+    {
+        Ok(Self {
+            token_messenger: bridge.token_messenger_v2_contract()?,
+            message_transmitter: bridge.message_transmitter_v2_contract()?,
+            destination_domain: bridge.destination_domain_id()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
-struct ExecutionPlan {
+struct BridgeIntent {
     route: RouteConfig,
     source_account: WalletAccount,
     recipient: Address,
@@ -1189,14 +1421,18 @@ struct ExecutionPlan {
     transfer_mode: TransferMode,
     relay: RelayMode,
     relay_account: Option<WalletAccount>,
+    provider_validation: ProviderValidation,
+    contracts: BridgeContracts,
 }
 
-impl ExecutionPlan {
+impl BridgeIntent {
     fn new(
         config: &BridgeConfig,
         source_account: WalletAccount,
         recipient: Address,
         relay_account: Option<WalletAccount>,
+        provider_validation: ProviderValidation,
+        contracts: BridgeContracts,
     ) -> Self {
         Self {
             route: config.route,
@@ -1207,6 +1443,8 @@ impl ExecutionPlan {
             transfer_mode: config.transfer_mode.clone(),
             relay: config.relay,
             relay_account,
+            provider_validation,
+            contracts,
         }
     }
 }
@@ -1215,18 +1453,42 @@ impl ExecutionPlan {
 struct HumanReporter;
 
 impl HumanReporter {
-    fn report_plan(self, plan: &ExecutionPlan) {
-        println!("Route: {}", plan.route);
-        self.report_wallet_account("Source", &plan.source_account);
-        println!("Recipient: {}", plan.recipient);
-        println!("USDC: {}", plan.usdc);
-        println!("Amount: {} USDC", plan.amount);
-        println!("Mode: {}", mode_label(&plan.transfer_mode));
-        println!("Relay: {}", plan.relay);
-        match plan.relay_account {
+    fn report_intent(self, intent: &BridgeIntent) {
+        println!("Bridge intent");
+        println!("Route: {}", intent.route);
+        self.report_provider_check(&intent.provider_validation.source);
+        self.report_provider_check(&intent.provider_validation.destination);
+        self.report_wallet_account("Source", &intent.source_account);
+        println!("Recipient: {}", intent.recipient);
+        println!("USDC: {}", intent.usdc);
+        println!("Amount: {} USDC", intent.amount);
+        self.report_transfer_mode(&intent.transfer_mode);
+        println!("Relay: {}", intent.relay);
+        match intent.relay_account {
             Some(account) => self.report_wallet_account("Relay", &account),
             None => println!("Destination provider: read-only"),
         }
+        println!(
+            "TokenMessengerV2 approval spender: {}",
+            intent.contracts.token_messenger
+        );
+        println!(
+            "MessageTransmitterV2 destination contract: {}",
+            intent.contracts.message_transmitter
+        );
+        println!(
+            "Destination domain: {}",
+            intent.contracts.destination_domain
+        );
+    }
+
+    fn report_provider_check(self, check: &ProviderChainCheck) {
+        println!(
+            "{} verified: {} (chain id {})",
+            check.role.report_label(),
+            check.chain_label,
+            check.actual_chain_id
+        );
     }
 
     fn report_wallet_account(self, label: &str, account: &WalletAccount) {
@@ -1238,6 +1500,16 @@ impl HumanReporter {
             account.chain_label, account.chain_id
         );
         println!("{label} address: {}", account.address);
+    }
+
+    fn report_transfer_mode(self, mode: &TransferMode) {
+        println!("Mode: {}", mode_label(mode));
+        if mode.is_fast() {
+            println!(
+                "Fast fee cap: {} USDC",
+                UsdcAmount::from_atomic(mode.max_fee())
+            );
+        }
     }
 
     fn report_dry_run_complete(self) {
@@ -1365,6 +1637,7 @@ mod tests {
             receive_attempts: None,
             receive_interval_secs: None,
             dry_run: None,
+            yes: false,
         }
     }
 
@@ -1397,6 +1670,7 @@ mod tests {
         assert_eq!(config.rpc.source.as_str(), "https://ethereum.example/");
         assert_eq!(config.rpc.destination.as_str(), "https://hyperevm.example/");
         assert!(matches!(config.transfer_mode, TransferMode::Standard));
+        assert_eq!(config.confirmation, ConfirmationPolicy::RequireInteractive);
     }
 
     #[test]
@@ -1612,6 +1886,16 @@ dry_run = true
     }
 
     #[test]
+    fn config_service_keeps_confirmation_skip_cli_only() {
+        let mut args = sample_args();
+        args.yes = true;
+
+        let config = empty_service().bridge_config(args).expect("valid config");
+
+        assert_eq!(config.confirmation, ConfirmationPolicy::SkipPrompt);
+    }
+
+    #[test]
     fn config_service_uses_env_rpc_over_file() {
         let path = write_config(
             r#"
@@ -1654,6 +1938,147 @@ hyperevm_rpc = "https://file.hyperevm.example"
 
         assert!(
             error.to_string().contains("missing amount"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn provider_validation_accepts_expected_chain_ids() {
+        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+
+        let validation =
+            ProviderValidation::new(route, route.source_chain_id(), route.destination_chain_id())
+                .expect("chain IDs match");
+
+        assert_eq!(
+            validation.source,
+            ProviderChainCheck {
+                role: ProviderEndpointRole::Source,
+                chain_label: "Ethereum mainnet",
+                expected_chain_id: route.source_chain_id(),
+                actual_chain_id: route.source_chain_id()
+            }
+        );
+        assert_eq!(
+            validation.destination,
+            ProviderChainCheck {
+                role: ProviderEndpointRole::Destination,
+                chain_label: "HyperEVM",
+                expected_chain_id: route.destination_chain_id(),
+                actual_chain_id: route.destination_chain_id()
+            }
+        );
+    }
+
+    #[test]
+    fn provider_validation_rejects_source_chain_mismatch_with_route_context() {
+        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+
+        let error = ProviderValidation::new(route, 31_337, route.destination_chain_id())
+            .expect_err("source mismatch is invalid");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("source RPC"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Ethereum mainnet -> HyperEVM"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("expected 1"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("got 31337"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn provider_validation_rejects_destination_chain_mismatch_with_route_context() {
+        let route = RouteConfig::new(ChainArg::Ethereum, ChainArg::HyperEvm).expect("valid route");
+
+        let error = ProviderValidation::new(route, route.source_chain_id(), 31_337)
+            .expect_err("destination mismatch is invalid");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("destination RPC"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Ethereum mainnet -> HyperEVM"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&format!("expected {}", route.destination_chain_id())),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("got 31337"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn bridge_intent_captures_contracts_provider_checks_and_relay_account() {
+        let mut args = sample_args();
+        args.self_relay = Some(true);
+        args.relay_trezor_account = Some(2);
+        let config = empty_service().bridge_config(args).expect("valid config");
+        let source_account = config.source_wallet.account_info(
+            WalletRole::SourceBurn,
+            config.route.source_label(),
+            config.route.source_chain_id(),
+            source_sender(),
+        );
+        let relay_account = config
+            .relay_wallet
+            .wallet()
+            .expect("relay wallet")
+            .account_info(
+                WalletRole::DestinationRelay,
+                config.route.destination_label(),
+                config.route.destination_chain_id(),
+                address!("0000000000000000000000000000000000000004"),
+            );
+        let provider_validation = ProviderValidation::new(
+            config.route,
+            config.route.source_chain_id(),
+            config.route.destination_chain_id(),
+        )
+        .expect("chain IDs match");
+        let contracts = BridgeContracts {
+            token_messenger: address!("0000000000000000000000000000000000000010"),
+            message_transmitter: address!("0000000000000000000000000000000000000020"),
+            destination_domain: DomainId::HyperEvm,
+        };
+
+        let intent = BridgeIntent::new(
+            &config,
+            source_account,
+            recipient(),
+            Some(relay_account),
+            provider_validation,
+            contracts,
+        );
+
+        assert_eq!(intent.route, config.route);
+        assert_eq!(intent.source_account, source_account);
+        assert_eq!(intent.recipient, recipient());
+        assert_eq!(
+            intent.amount,
+            UsdcAmount::from_atomic(U256::from(1_250_000u64))
+        );
+        assert_eq!(intent.relay, RelayMode::SelfRelay);
+        assert_eq!(intent.relay_account, Some(relay_account));
+        assert_eq!(intent.provider_validation, provider_validation);
+        assert_eq!(intent.contracts, contracts);
+    }
+
+    #[test]
+    fn confirmation_input_requires_exact_confirm_token() {
+        validate_confirmation_input("CONFIRM\n").expect("CONFIRM is accepted");
+
+        let error = validate_confirmation_input("confirm\n").expect_err("lowercase is rejected");
+        assert!(
+            error.to_string().contains("not confirmed"),
             "unexpected error: {error}"
         );
     }

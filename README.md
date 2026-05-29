@@ -45,9 +45,13 @@ To self-relay, add `--self-relay`; the relay account must hold HyperEVM gas.
 The relay signer defaults to `--trezor-account`, but can be selected
 independently with `--relay-trezor-account`.
 
-Before any signing prompt, the CLI prints each active Trezor account's role,
-derivation path, chain binding, and address. Use `--dry-run` to inspect those
-details without sending transactions.
+Before any signing prompt, the CLI verifies both RPC providers report the
+expected chain IDs, resolves the CCTP contracts, and prints a bridge intent with
+the active Trezor account roles, derivation paths, chain bindings, addresses,
+amount, fee cap, approval spender, destination MessageTransmitter, and relay
+policy. A live run requires typing `CONFIRM` after reviewing that intent. Use
+`--dry-run` to render the same intent without sending transactions, or `--yes`
+for explicit non-interactive automation.
 
 ## Configuration
 
